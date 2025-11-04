@@ -51,7 +51,7 @@ AI assistance (Gemini) was used to establish the modular Python package structur
 
 
 # step 6 1. conclusion ⏳ 
-The 20-Minute Execution DelayThe time delay is a necessity imposed by the nature of financial time-series analysis, not a technical bug in the code.AspectExplanationThe BottleneckYour primary analysis (the OLS Regression and Z-Score calculation) is designed to run on 1-minute (1m) bars. A 1-minute bar's Close price cannot be known until 60 full seconds have elapsed in real-world time. Your application must wait for the market, not the CPU.The RequirementYou set the minimum historical data required—the ROLLING_WINDOW—to 20 bars (20 minutes) for testing purposes. This is the minimum amount of data required to establish a statistically valid historical mean and standard deviation for the spread.Action After WaitOnce the 20th minute closes and the bar is saved to MongoDB, the Python Analytics loop executes the complex math (which takes milliseconds) and instantly pushes the result over the WebSocket to your dashboard.
+<img width="1912" height="910" alt="Screenshot 2025-11-04 114312" src="https://github.com/user-attachments/assets/7961e34f-a94b-4b9c-afd5-1f57965185a2" />
 
 
 
