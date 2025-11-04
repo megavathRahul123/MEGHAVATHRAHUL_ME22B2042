@@ -51,7 +51,9 @@ AI assistance (Gemini) was used to establish the modular Python package structur
 
 
 # step 6 1. conclusion ⏳ 
-<img width="1912" height="910" alt="Screenshot 2025-11-04 114312" src="https://github.com/user-attachments/assets/7961e34f-a94b-4b9c-afd5-1f57965185a2" />
+<img width="1029" height="484" alt="result1" src="https://github.com/user-attachments/assets/6bde7f64-0d07-436f-9e82-6f95154f4a38" />
+
+<img width="1023" height="896" alt="result2" src="https://github.com/user-attachments/assets/d1bef842-decd-4202-ae9d-9932af609b6f" />
 
 
 
