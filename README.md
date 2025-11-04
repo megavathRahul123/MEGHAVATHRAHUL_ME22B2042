@@ -57,5 +57,37 @@ AI assistance (Gemini) was used to establish the modular Python package structur
 
 
 
+7
+⚙️ Technology Stack and DependenciesYour application uses a robust, full-stack architecture built on two separate language environments:A. Python Backend (Compute & Data Engine)This layer runs the analysis and data streams (MANDATORY).PackagePurpose in the ProjectFastAPI/UvicornThe Python framework and ASGI server that hosts the REST API and manages all asynchronous tasks (WebSockets, ingestion, processing).websocketsUsed by the ingestion pipeline to maintain the live connection to the Binance Futures market data feed.pandas / numpyThe core libraries used in processing.py to aggregate raw ticks into 1m/5m OHLC bars and in analytics.py for all data manipulation.statsmodelsUsed in analytics.py to perform the heavy lifting: OLS Regression (to find the Hedge Ratio) and statistical measures (Z-Score, standard deviation).motorThe asynchronous Python driver necessary for the FastAPI application to efficiently communicate with MongoDB without blocking the main event loop.B. React Frontend (Visualization & Display)This layer handles the user experience.PackagePurpose in the ProjectReact / ViteThe framework used to build the responsive, single-page dashboard application.react-plotly.jsThe core library for visualization, rendering complex candlestick charts and fulfilling the requirement for zoom, pan, and hover interactivity.use-websocketThe custom hook logic that maintains the continuous, low-latency WebSocket connection to the FastAPI server on port 8000 to receive live Z-Score updates.
 
-2. ⚙️ Technology Stack and DependenciesYour application uses a robust, full-stack architecture built on two separate language environments:A. Python Backend (Compute & Data Engine)This layer runs the analysis and data streams (MANDATORY).PackagePurpose in the ProjectFastAPI/UvicornThe Python framework and ASGI server that hosts the REST API and manages all asynchronous tasks (WebSockets, ingestion, processing).websocketsUsed by the ingestion pipeline to maintain the live connection to the Binance Futures market data feed.pandas / numpyThe core libraries used in processing.py to aggregate raw ticks into 1m/5m OHLC bars and in analytics.py for all data manipulation.statsmodelsUsed in analytics.py to perform the heavy lifting: OLS Regression (to find the Hedge Ratio) and statistical measures (Z-Score, standard deviation).motorThe asynchronous Python driver necessary for the FastAPI application to efficiently communicate with MongoDB without blocking the main event loop.B. React Frontend (Visualization & Display)This layer handles the user experience.PackagePurpose in the ProjectReact / ViteThe framework used to build the responsive, single-page dashboard application.react-plotly.jsThe core library for visualization, rendering complex candlestick charts and fulfilling the requirement for zoom, pan, and hover interactivity.use-websocketThe custom hook logic that maintains the continuous, low-latency WebSocket connection to the FastAPI server on port 8000 to receive live Z-Score updates.
+# 8 flow cahrt & achitecture diagram
+flowchart TD
+
+A[Market Data Source (Binance Futures)] -->|Live Tick Stream (Price/Volume)| B[Backend Ingestion Layer (FastAPI + WebSocket)]
+B -->|Async Queue Buffer| C[Data Buffering (asyncio.Queue)]
+C -->|Tick Aggregation| D[Data Processing (Pandas)]
+D -->|1m & 5m OHLC Bars| E[MongoDB Storage]
+
+E -->|Historical Data Access| F[Analytics Engine (statsmodels + numpy + pandas)]
+F -->|Calculates Hedge Ratio (β) & Z-Score| G[Signal Generator]
+
+G -->|Live Signal Data (Z-Score, Ratio)| H[FastAPI WebSocket Stream]
+H -->|Push Updates| I[React Frontend (Plotly Dashboard)]
+
+I -->|User Interaction| J[Visualization (Zoom, Pan, Hover)]
+
+subgraph Backend
+B
+C
+D
+E
+F
+G
+H
+end
+
+subgraph Frontend
+I
+J
+end
+# Note: This diagram illustrates the end-to-end data flow from live market data ingestion to real-time visualization on the dashboard, highlighting the modular components and their interactions.
