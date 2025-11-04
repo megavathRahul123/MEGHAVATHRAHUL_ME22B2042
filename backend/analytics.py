@@ -1,72 +1,42 @@
 # backend/analytics.py
 
-import pandas as pd
-import numpy as np
-from statsmodels.api import OLS, add_constant
 import asyncio
 import json
-# FIX: Import the entire storage module as an alias
-import backend.storage as storage
-# Import from nested API module
-from .api.websocket import broadcast_live_data 
-
-# --- Configuration ---
-PAIR_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
-TIMEFRAME = "1m" 
-ROLLING_WINDOW = 20 # Using 20 for quick testing
-
-async def fetch_historical_bars(symbol: str, timeframe: str, limit: int = ROLLING_WINDOW):
-    """Fetches the latest completed bars from MongoDB for analytics."""
-    # Check the global state through the imported module object
-    if storage.MONGO_DB is None: return pd.DataFrame()
-
-    # Access the MONGO_DB object via the imported module alias
-    cursor = storage.MONGO_DB['resampled_bars'].find(
-        {"symbol": symbol, "timeframe": timeframe},
-        {"_id": 0, "timestamp": 1, "close": 1}
-    ).sort("timestamp", -1).limit(limit)
-    
-    data = await cursor.to_list(length=limit)
-    # ... (rest of the function remains the same) ...
-    df = pd.DataFrame(data)
-    
-    if df.empty: return pd.DataFrame()
-    
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df = df.set_index('timestamp').sort_index()
-    
-    return df['close'].rename(symbol) 
-# ... (rest of the file remains the same) ...import asyncio
-import json
 import logging
-
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 
 import backend.storage as storage
-from backend.api.websocket import broadcast_live_data
+from backend.common import LATEST_PRICE_QUEUE 
+from backend.api.websocket import broadcast_live_data 
 
 log = logging.getLogger("analytics")
 log.setLevel(logging.INFO)
 
-
 # --- Configuration ---
 PAIR_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 TIMEFRAME = "1m"
-ROLLING_WINDOW = 20       # number of bars required before analytics runs
-SLEEP_SECONDS = 1         # main analytics loop interval
-RECONNECT_SLEEP = 5       # wait when not enough data
+ROLLING_WINDOW = 5       
+RECONNECT_SLEEP = 5      
+PRICE_CACHE = {sym: None for sym in PAIR_SYMBOLS} 
+
+# --- MOCK VALUES FOR INSTANT START ---
+# These are used for the first ~5 minutes until real OLS stats are calculated.
+MOCK_BASE_STATS = {
+    "slope": 16.5,          # Mock Hedge Ratio (beta)
+    "intercept": -140000.0, # Mock Intercept (alpha)
+    "spread_mean": 0.0,     # Assume zero mean spread for simplicity
+    "spread_std": 500.0,    # Mock Standard Deviation (required to avoid division by zero)
+}
 
 
 async def fetch_historical_bars(symbol: str, timeframe: str, limit: int = ROLLING_WINDOW) -> pd.Series:
-    """
-    Fetch latest completed bars from MongoDB and return a pd.Series of closes indexed by timestamp.
-    Returns an empty Series if DB is not ready or no usable data found.
-    """
+    """Fetches the latest completed bars from MongoDB."""
     if storage.MONGO_DB is None:
         log.debug("fetch_historical_bars: storage.MONGO_DB is None")
         return pd.Series(dtype=float, name=symbol)
+    # ... (Database fetching and pandas conversion logic remains the same) ...
 
     try:
         cursor = storage.MONGO_DB["resampled_bars"].find(
@@ -83,20 +53,13 @@ async def fetch_historical_bars(symbol: str, timeframe: str, limit: int = ROLLIN
         return pd.Series(dtype=float, name=symbol)
 
     df = pd.DataFrame(data)
-    if "timestamp" not in df.columns or "close" not in df.columns:
-        return pd.Series(dtype=float, name=symbol)
-
-    # Try common timestamp formats (ms since epoch or ISO)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", errors="coerce")
-    if df["timestamp"].isna().all():
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-
+    
+    # Robust Timestamp and Data Conversion
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df = df.dropna(subset=["timestamp", "close"])
-    if df.empty:
-        return pd.Series(dtype=float, name=symbol)
-
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
     df = df.dropna(subset=["close"])
+    
     if df.empty:
         return pd.Series(dtype=float, name=symbol)
 
@@ -107,225 +70,124 @@ async def fetch_historical_bars(symbol: str, timeframe: str, limit: int = ROLLIN
 
 def compute_ols(x: pd.Series, y: pd.Series):
     """
-    Compute OLS regression y ~ x using statmodels.
-    Returns dict with slope, intercept and r2.
-    Assumes x and y are aligned by index.
+    Compute OLS regression y ~ x (ETH ~ BTC) to find the hedge ratio (beta) 
+    and historical spread statistics (mean and std dev).
     """
-    if x.empty or y.empty:
-        return None
+    if x.empty or y.empty: return None
 
-    # Align on timestamps, take the overlapping window
     df = pd.concat([x, y], axis=1).dropna()
-    if df.shape[0] < 2:
-        return None
+    if df.shape[0] < 2: return None
 
-    X = sm.add_constant(df.iloc[:, 0].values)  # x
-    Y = df.iloc[:, 1].values                   # y
+    X_train = sm.add_constant(df.iloc[:, 0].values)
+    Y_train = df.iloc[:, 1].values
 
     try:
-        model = sm.OLS(Y, X).fit()
+        model = sm.OLS(Y_train, X_train).fit()
     except Exception as e:
         log.warning("Analytics: OLS fit failed: %s", e)
         return None
 
+    alpha = model.params[0]
+    beta = model.params[1]
+    
+    # Calculate the historical spread: Spread = Y - (Alpha + Beta * X)
+    spread = df.iloc[:, 1] - (alpha + beta * df.iloc[:, 0]) 
+    
+    # Spread statistics
+    spread_mean = spread.mean()
+    spread_std = spread.std()
+    
     return {
-        "slope": float(model.params[1]),
-        "intercept": float(model.params[0]),
-        "r2": float(model.rsquared),
-        "n": int(model.nobs),
+        "slope": float(beta),
+        "intercept": float(alpha),
+        "spread_mean": float(spread_mean),
+        "spread_std": float(spread_std),
     }
 
 
 async def start_analytics_loop():
-    """Main analytics loop: waits for enough historical 1m bars, computes OLS and broadcasts results."""
-    log.info("Analytics: Analytics loop initialized. Waiting for enough data...")
-    await asyncio.sleep(0.1)
+    """
+    Main analytics loop. Uses MOCK data instantly, then switches to real OLS stats
+    once enough historical data is collected.
+    """
+    log.info("Analytics: Real-time loop initialized. Waiting for prices...")
+    
+    # --- PHASE 1: PRIMING or USING MOCK STATS ---
+    base_stats = MOCK_BASE_STATS
+    
+    # Run the initial OLS calculation once to get real stats
+    x_hist = await fetch_historical_bars(PAIR_SYMBOLS[0], TIMEFRAME, limit=ROLLING_WINDOW)
+    y_hist = await fetch_historical_bars(PAIR_SYMBOLS[1], TIMEFRAME, limit=ROLLING_WINDOW)
+    real_stats = compute_ols(x_hist, y_hist)
+    
+    # If real stats are available on startup (e.g., if you already had data in DB), use them
+    if real_stats:
+        base_stats = real_stats
+        log.info("Analytics: Found historical data on startup. Using real OLS stats.")
+    else:
+        log.warning("Analytics: Not enough historical data. Using MOCK stats for instant display.")
 
+    # --- PHASE 2: REAL-TIME TICK PROCESSING ---
     while True:
+        # Check if we need to update our base stats (after initial mock period)
+        if base_stats == MOCK_BASE_STATS:
+            x_hist = await fetch_historical_bars(PAIR_SYMBOLS[0], TIMEFRAME, limit=ROLLING_WINDOW)
+            y_hist = await fetch_historical_bars(PAIR_SYMBOLS[1], TIMEFRAME, limit=ROLLING_WINDOW)
+            real_stats_check = compute_ols(x_hist, y_hist)
+            if real_stats_check:
+                base_stats = real_stats_check
+                log.info("Analytics: Priming complete. Switched from MOCK to REAL OLS stats!")
+        
+        
+        # 1. Collect the latest price tick(s)
+        ticks = []
         try:
-            # fetch series for each symbol
-            series_map = {}
-            for s in PAIR_SYMBOLS:
-                series_map[s] = await fetch_historical_bars(s, TIMEFRAME, limit=ROLLING_WINDOW)
+            # Drain the queue to ensure we only get the latest price available
+            while True:
+                ticks.append(LATEST_PRICE_QUEUE.get_nowait())
+        except asyncio.QueueEmpty:
+            pass
+            
+        # 2. Update the price cache
+        if ticks:
+            last_tick = ticks[-1]
+            PRICE_CACHE[last_tick['symbol'].upper()] = last_tick['price']
 
-            # check if all symbols have enough bars
-            lengths = {s: len(series_map[s]) for s in series_map}
-            if any(v < ROLLING_WINDOW for v in lengths.values()):
-                log.info("Analytics: Not enough %s data to run OLS (%s/%d).", TIMEFRAME, lengths, ROLLING_WINDOW)
-                await asyncio.sleep(RECONNECT_SLEEP)
-                continue
+        # 3. Check for prices on both assets
+        price_x = PRICE_CACHE[PAIR_SYMBOLS[0]]
+        price_y = PRICE_CACHE[PAIR_SYMBOLS[1]]
+        
+        if price_x is None or price_y is None:
+            await asyncio.sleep(0.1)
+            continue
 
-            # example: compute OLS ETH ~ BTC (y ~ x)
-            x = series_map[PAIR_SYMBOLS[0]]
-            y = series_map[PAIR_SYMBOLS[1]]
-            ols_res = compute_ols(x, y)
+        # --- Real-Time Z-Score Calculation ---
+        alpha = base_stats['intercept']
+        beta = base_stats['slope']
+        spread_mean = base_stats['spread_mean']
+        spread_std = base_stats['spread_std']
+        
+        # Calculate latest spread using the real-time prices
+        latest_spread = price_y - (alpha + beta * price_x)
+        
+        # Calculate real-time Z-score: Z = (Spread - Mean) / StdDev
+        z_score = (latest_spread - spread_mean) / spread_std if spread_std != 0 else 0.0
+        
+        # 4. Prepare and Broadcast Payload (Matching Frontend Fields)
+        payload = {
+            "type": "analytics_update",
+            "z_score": float(z_score),           
+            "hedge_ratio": float(beta),         
+            "latest_spread": float(latest_spread), 
+            "symbol_pair": f"{PAIR_SYMBOLS[1]} / {PAIR_SYMBOLS[0]}", 
+            "timestamp": pd.Timestamp.now().isoformat(),
+        }
 
-            payload = {
-                "type": "analytics_update",
-                "timeframe": TIMEFRAME,
-                "window": ROLLING_WINDOW,
-                "counts": lengths,
-                "ols": ols_res,
-            }
-
-            try:
-                # broadcast to websocket clients (assumes broadcast_live_data is async)
-                await broadcast_live_data(json.dumps(payload))
-            except Exception as e:
-                log.debug("Analytics: broadcast failed: %s", e)
-
-            await asyncio.sleep(SLEEP_SECONDS)
-
-        except asyncio.CancelledError:
-            log.info("Analytics: cancellation requested, stopping analytics loop.")
-            break
-        except Exception as e:
-            log.exception("Analytics: unexpected error in analytics loop: %s", e)
-            await asyncio.sleep(RECONNECT_SLEEP)
-
-import asyncio
-import json
-import logging
-
-import numpy as np
-import pandas as pd
-import statsmodels.api as sm
-
-import backend.storage as storage
-from backend.api.websocket import broadcast_live_data
-
-log = logging.getLogger("analytics")
-log.setLevel(logging.INFO)
-
-
-# --- Configuration ---
-PAIR_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
-TIMEFRAME = "1m"
-ROLLING_WINDOW = 20       # number of bars required before analytics runs
-SLEEP_SECONDS = 1         # main analytics loop interval
-RECONNECT_SLEEP = 5       # wait when not enough data
-
-
-async def fetch_historical_bars(symbol: str, timeframe: str, limit: int = ROLLING_WINDOW) -> pd.Series:
-    """
-    Fetch latest completed bars from MongoDB and return a pd.Series of closes indexed by timestamp.
-    Returns an empty Series if DB is not ready or no usable data found.
-    """
-    if storage.MONGO_DB is None:
-        log.debug("fetch_historical_bars: storage.MONGO_DB is None")
-        return pd.Series(dtype=float, name=symbol)
-
-    try:
-        cursor = storage.MONGO_DB["resampled_bars"].find(
-            {"symbol": symbol, "timeframe": timeframe},
-            {"_id": 0, "timestamp": 1, "close": 1},
-        ).sort("timestamp", -1).limit(limit)
-
-        data = await cursor.to_list(length=limit)
-    except Exception as e:
-        log.warning("Analytics: DB read error for %s %s: %s", symbol, timeframe, e)
-        return pd.Series(dtype=float, name=symbol)
-
-    if not data:
-        return pd.Series(dtype=float, name=symbol)
-
-    df = pd.DataFrame(data)
-    if "timestamp" not in df.columns or "close" not in df.columns:
-        return pd.Series(dtype=float, name=symbol)
-
-    # Try common timestamp formats (ms since epoch or ISO)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", errors="coerce")
-    if df["timestamp"].isna().all():
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-
-    df = df.dropna(subset=["timestamp", "close"])
-    if df.empty:
-        return pd.Series(dtype=float, name=symbol)
-
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    df = df.dropna(subset=["close"])
-    if df.empty:
-        return pd.Series(dtype=float, name=symbol)
-
-    df = df.sort_values("timestamp").set_index("timestamp")
-    series = df["close"].rename(symbol)
-    return series
-
-
-def compute_ols(x: pd.Series, y: pd.Series):
-    """
-    Compute OLS regression y ~ x using statmodels.
-    Returns dict with slope, intercept and r2.
-    Assumes x and y are aligned by index.
-    """
-    if x.empty or y.empty:
-        return None
-
-    # Align on timestamps, take the overlapping window
-    df = pd.concat([x, y], axis=1).dropna()
-    if df.shape[0] < 2:
-        return None
-
-    X = sm.add_constant(df.iloc[:, 0].values)  # x
-    Y = df.iloc[:, 1].values                   # y
-
-    try:
-        model = sm.OLS(Y, X).fit()
-    except Exception as e:
-        log.warning("Analytics: OLS fit failed: %s", e)
-        return None
-
-    return {
-        "slope": float(model.params[1]),
-        "intercept": float(model.params[0]),
-        "r2": float(model.rsquared),
-        "n": int(model.nobs),
-    }
-
-
-async def start_analytics_loop():
-    """Main analytics loop: waits for enough historical 1m bars, computes OLS and broadcasts results."""
-    log.info("Analytics: Analytics loop initialized. Waiting for enough data...")
-    await asyncio.sleep(0.1)
-
-    while True:
+        # Broadcast instantly
         try:
-            # fetch series for each symbol
-            series_map = {}
-            for s in PAIR_SYMBOLS:
-                series_map[s] = await fetch_historical_bars(s, TIMEFRAME, limit=ROLLING_WINDOW)
-
-            # check if all symbols have enough bars
-            lengths = {s: len(series_map[s]) for s in series_map}
-            if any(v < ROLLING_WINDOW for v in lengths.values()):
-                log.info("Analytics: Not enough %s data to run OLS (%s/%d).", TIMEFRAME, lengths, ROLLING_WINDOW)
-                await asyncio.sleep(RECONNECT_SLEEP)
-                continue
-
-            # example: compute OLS ETH ~ BTC (y ~ x)
-            x = series_map[PAIR_SYMBOLS[0]]
-            y = series_map[PAIR_SYMBOLS[1]]
-            ols_res = compute_ols(x, y)
-
-            payload = {
-                "type": "analytics_update",
-                "timeframe": TIMEFRAME,
-                "window": ROLLING_WINDOW,
-                "counts": lengths,
-                "ols": ols_res,
-            }
-
-            try:
-                # broadcast to websocket clients (assumes broadcast_live_data is async)
-                await broadcast_live_data(json.dumps(payload))
-            except Exception as e:
-                log.debug("Analytics: broadcast failed: %s", e)
-
-            await asyncio.sleep(SLEEP_SECONDS)
-
-        except asyncio.CancelledError:
-            log.info("Analytics: cancellation requested, stopping analytics loop.")
-            break
-        except Exception as e:
-            log.exception("Analytics: unexpected error in analytics loop: %s", e)
-            await asyncio.sleep(RECONNECT_SLEEP)
+            await broadcast_live_data(json.dumps(payload))
+        except Exception:
+            pass 
+        
+        # Small sleep to prevent tight loop burning CPU
+        await asyncio.sleep(0.01)

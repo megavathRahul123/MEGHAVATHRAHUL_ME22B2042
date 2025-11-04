@@ -1,9 +1,10 @@
-# backend/common.py
-
 import asyncio
 
 # --- Shared Configuration (Used by ingestion, processing, and analytics) ---
 DEFAULT_SYMBOLS = ["btcusdt", "ethusdt"] 
 
-# --- Shared Resources (The In-Memory Queue) ---
+# Queue for raw ticks (Ingestion -> Processing)
 RAW_TICK_QUEUE = asyncio.Queue()
+
+# NEW: Queue for latest prices (Processing -> Analytics)
+LATEST_PRICE_QUEUE = asyncio.Queue()
